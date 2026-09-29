@@ -382,19 +382,63 @@ modify_sni() {
         echo -e "${RED}未找到配置文件，请先安装！${PLAIN}"
         return
     fi
-    read -p "请输入新的伪装域名 SNI: " NEW_SNI
-    if [[ -n "$NEW_SNI" ]]; then
-        echo -e "${YELLOW}正在校验新域名 $NEW_SNI ...${PLAIN}"
-        /usr/local/bin/xray tls ping "$NEW_SNI"
-        
-        TMP_JSON=$(mktemp)
-        jq --arg sni "$NEW_SNI" '.inbounds[0].streamSettings.realitySettings.serverNames[0] = $sni | .inbounds[0].streamSettings.realitySettings.dest = ($sni + ":443")' $CONFIG_FILE > $TMP_JSON
-        mv $TMP_JSON $CONFIG_FILE
+    local CUR_SNI
+    CUR_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' $CONFIG_FILE 2>/dev/null)
+    echo -e "${BLUE}当前伪装域名：$CUR_SNI${PLAIN}"
 
-        systemctl restart xray
-        echo -e "${GREEN}伪装域名更新成功！Xray 已自动重启。${PLAIN}"
-        show_link
+    read -p "请输入新的伪装域名 SNI: " NEW_SNI
+    if [[ -z "$NEW_SNI" ]]; then
+        echo -e "${YELLOW}未输入域名，已取消。${PLAIN}"
+        return
     fi
+
+    # REALITY 依赖目标站点的 TLS 回落，握手不通或不支持 X25519 都会导致客户端报 EOF
+    echo -e "${YELLOW}正在校验 $NEW_SNI 的 TLS 握手（REALITY 回落依赖它）...${PLAIN}"
+    PING_OUT=$(/usr/local/bin/xray tls ping "$NEW_SNI" 2>&1)
+    echo "$PING_OUT"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}警告：$NEW_SNI 握手失败，REALITY 无法回落，客户端通常会报 EOF。${PLAIN}"
+        read -p "仍要强制使用？(y/n) [默认 n]: " FORCE_SNI
+        if [[ "$FORCE_SNI" != "y" && "$FORCE_SNI" != "Y" ]]; then
+            echo -e "${YELLOW}已取消，配置未改动。${PLAIN}"
+            return
+        fi
+    else
+        echo -e "${YELLOW}请确认上面输出中 TLS 版本为 1.3、密钥交换为 X25519，否则 REALITY 会失败。${PLAIN}"
+        read -p "确认继续？(y/n) [默认 y]: " OK_SNI
+        OK_SNI=${OK_SNI:-y}
+        if [[ "$OK_SNI" != "y" && "$OK_SNI" != "Y" ]]; then
+            echo -e "${YELLOW}已取消，配置未改动。${PLAIN}"
+            return
+        fi
+    fi
+
+    TMP_JSON=$(mktemp)
+    if ! jq --arg sni "$NEW_SNI" '.inbounds[0].streamSettings.realitySettings.serverNames[0] = $sni | .inbounds[0].streamSettings.realitySettings.dest = ($sni + ":443")' $CONFIG_FILE > $TMP_JSON; then
+        echo -e "${RED}配置改写失败（jq 出错），已放弃。${PLAIN}"
+        rm -f $TMP_JSON
+        return 1
+    fi
+    mv $TMP_JSON $CONFIG_FILE
+
+    TEST_OUT=$(/usr/local/bin/xray -test -c "$CONFIG_FILE" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}新配置校验失败：${PLAIN}"
+        echo "$TEST_OUT"
+        return 1
+    fi
+
+    systemctl restart xray
+    sleep 2
+    if ! systemctl is-active --quiet xray; then
+        echo -e "${RED}Xray 重启失败，日志如下：${PLAIN}"
+        journalctl -u xray -n 20 --no-pager
+        return 1
+    fi
+
+    echo -e "${GREEN}伪装域名已更新为 $NEW_SNI，Xray 已重启。${PLAIN}"
+    echo -e "${RED}重要：SNI 变更后客户端必须用下面的新链接重新导入，否则握手失败（EOF）。${PLAIN}"
+    show_link
 }
 
 # 修改 UUID
