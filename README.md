@@ -66,7 +66,17 @@ curl -fsSL https://cdn.jsdelivr.net/gh/iccolo/xhttp_deploy@main/xhttp-manager.sh
 | --- | --- |
 | `/usr/local/bin/xhttp` | 脚本本体 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
-| `/usr/local/etc/xray/env_info.env` | 记录 REALITY 公钥（`PUBKEY`），用于生成客户端链接 |
+| `/usr/local/etc/xray/env_info.env` | 记录 REALITY 公钥（`PUBKEY`）与节点备注（`REGION`），用于生成客户端链接 |
+
+## 节点备注
+
+导入链接末尾的节点名默认取 VPS 所在地区缩写（如 `us`、`jp`、`sg`），首次部署时通过 `ipinfo.io` 获取并缓存到 `env_info.env`。想自定义成 `us-01` 之类，直接改这个文件即可：
+
+```bash
+sed -i 's/^REGION=.*/REGION="us-01"/' /usr/local/etc/xray/env_info.env
+```
+
+然后用菜单 2 重新生成链接。缓存存在时不会再联网查询，改动也不会被菜单 7（重生成密钥）覆盖。
 
 ## 常见问题
 

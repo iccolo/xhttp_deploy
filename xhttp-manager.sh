@@ -182,6 +182,33 @@ detect_vps_info() {
     VPS_ASN=$(echo "$VPS_ORG" | grep -oE 'AS[0-9]+' | head -1 | sed 's/AS//')
 }
 
+# 获取 VPS 所在地区缩写（如 us / jp / sg），优先读 INFO_FILE 缓存，可手动改该文件自定义
+get_region() {
+    REGION_CODE=""
+    if [[ -f $INFO_FILE ]]; then
+        REGION_CODE=$(sed -n 's/^REGION="\(.*\)"$/\1/p' "$INFO_FILE" 2>/dev/null | head -1)
+    fi
+    [[ -n "$REGION_CODE" ]] && return 0
+
+    local JSON
+    JSON=$(curl -s4 --connect-timeout 6 --max-time 10 https://ipinfo.io/json 2>/dev/null)
+    REGION_CODE=$(echo "$JSON" | jq -r '.country // empty' 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    if [[ -z "$REGION_CODE" ]]; then
+        REGION_CODE=$(curl -s4 --connect-timeout 6 --max-time 10 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    fi
+    [[ -z "$REGION_CODE" ]] && REGION_CODE="node"
+    return 0
+}
+
+# 写入凭证信息（公钥 + 地区缩写）
+save_info() {
+    mkdir -p "$(dirname "$INFO_FILE")"
+    cat << ENVEOF > $INFO_FILE
+PUBKEY="$PUBKEY"
+REGION="$REGION_CODE"
+ENVEOF
+}
+
 # 单个域名是否支持 TLS 1.3
 probe_domain() {
     local out
@@ -414,10 +441,9 @@ install_xhttp() {
 }
 JSONEOF
 
-    # 保存公钥环境变量
-    cat << ENVEOF > $INFO_FILE
-PUBKEY="$PUBKEY"
-ENVEOF
+    # 保存公钥与地区缩写
+    get_region
+    save_info
 
     # 开放系统防火墙端口
     if command -v ufw &>/dev/null; then
@@ -492,7 +518,12 @@ show_link() {
         read -p "未找到记录的 Public Key，请输入对应公钥: " PUBKEY
     fi
 
-    URL="vless://${UUID}@${IP}:${PORT}?type=xhttp&security=reality&encryption=none&pbk=${PUBKEY}&fp=chrome&sni=${SNI}&sid=${SID}&mode=${MODE}&path=${PATH_ENC}#XHTTPS-Node"
+    # 节点备注用 VPS 所在地区缩写（如 us / jp / sg），失败时退化为 node
+    get_region
+    local REMARK_ENC
+    REMARK_ENC=$(printf '%s' "$REGION_CODE" | jq -sRr @uri)
+
+    URL="vless://${UUID}@${IP}:${PORT}?type=xhttp&security=reality&encryption=none&pbk=${PUBKEY}&fp=chrome&sni=${SNI}&sid=${SID}&mode=${MODE}&path=${PATH_ENC}#${REMARK_ENC}"
 
     echo -e "\n${YELLOW}------------------ v2rayNG / 客户端一键导入链接 ------------------${PLAIN}"
     echo -e "${GREEN}${URL}${PLAIN}"
@@ -701,9 +732,9 @@ regen_keys() {
     jq --arg pri "$PRIKEY" '.inbounds[0].streamSettings.realitySettings.privateKey = $pri' $CONFIG_FILE > $TMP_JSON
     mv $TMP_JSON $CONFIG_FILE
 
-    cat << ENVEOF > $INFO_FILE
-PUBKEY="$PUBKEY"
-ENVEOF
+    # 保留原有地区缩写（读缓存），只更新公钥
+    get_region
+    save_info
 
     echo -e "${GREEN}已写入私钥：${PRIKEY:0:8}...（长度 ${#PRIKEY}），公钥：${PUBKEY:0:8}...${PLAIN}"
 
