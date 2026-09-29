@@ -160,6 +160,17 @@ port_in_use() {
     fi
 }
 
+# 规范化用户输入的域名：去掉协议前缀、路径、端口和空白，只保留主机名
+normalize_host() {
+    local h=$1
+    h=$(echo "$h" | tr -d '[:space:]')
+    h=${h#http://}
+    h=${h#https://}
+    h=${h%%/*}
+    h=${h%%:*}
+    echo "$h"
+}
+
 # 获取公网 IP
 get_ip() {
     IP=$(curl -s4 -m 5 ifconfig.me || curl -s4 -m 5 api.ipify.org)
@@ -200,7 +211,7 @@ install_xhttp() {
     # 验证域名
     while true; do
         read -p "请输入用于 REALITY 的伪装域名 [默认 magnet.crowdcafe.com]: " SNI
-        SNI=${SNI:-magnet.crowdcafe.com}
+        SNI=$(normalize_host "${SNI:-magnet.crowdcafe.com}")
         echo -e "${YELLOW}正在校验域名 $SNI 是否正常响应...${PLAIN}"
         
         /usr/local/bin/xray tls ping "$SNI" &>/dev/null
@@ -387,10 +398,12 @@ modify_sni() {
     echo -e "${BLUE}当前伪装域名：$CUR_SNI${PLAIN}"
 
     read -p "请输入新的伪装域名 SNI: " NEW_SNI
+    NEW_SNI=$(normalize_host "$NEW_SNI")
     if [[ -z "$NEW_SNI" ]]; then
-        echo -e "${YELLOW}未输入域名，已取消。${PLAIN}"
+        echo -e "${YELLOW}未输入有效域名，已取消。${PLAIN}"
         return
     fi
+    echo -e "${BLUE}规范化后的域名：$NEW_SNI${PLAIN}"
 
     # REALITY 依赖目标站点的 TLS 回落，握手不通或不支持 X25519 都会导致客户端报 EOF
     echo -e "${YELLOW}正在校验 $NEW_SNI 的 TLS 握手（REALITY 回落依赖它）...${PLAIN}"
