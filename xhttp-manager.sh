@@ -171,6 +171,111 @@ normalize_host() {
     echo "$h"
 }
 
+# ===== 伪装域名自动探测（REALITY 要求目标站点支持 TLS 1.3 + X25519）=====
+
+# 探测 VPS 归属（IP / 运营商 / ASN）
+detect_vps_info() {
+    local JSON
+    JSON=$(curl -s4 --connect-timeout 8 --max-time 12 https://ipinfo.io/json 2>/dev/null)
+    VPS_IP=$(echo "$JSON" | jq -r '.ip // empty' 2>/dev/null)
+    VPS_ORG=$(echo "$JSON" | jq -r '.org // empty' 2>/dev/null)
+    VPS_ASN=$(echo "$VPS_ORG" | grep -oE 'AS[0-9]+' | head -1 | sed 's/AS//')
+}
+
+# 单个域名是否支持 TLS 1.3
+probe_domain() {
+    local out
+    out=$(timeout 8 /usr/local/bin/xray tls ping "$1" 2>&1)
+    echo "$out" | grep -qE 'TLS[[:space:]]*1\.3' || return 1
+    return 0
+}
+
+# 方式一：从证书日志反查同网段 / 同运营商的真实域名并实测
+scan_domains_crt() {
+    local RAW D CLEAN_ORG COUNT=0
+    [[ -z "$VPS_IP" ]] && return 0
+
+    RAW=$(curl -s --connect-timeout 8 --max-time 15 "https://crt.sh/?q=${VPS_IP%.*}.0/24&output=json" 2>/dev/null \
+        | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | sort -u | head -n 15)
+
+    if [[ -z "$RAW" ]]; then
+        CLEAN_ORG=$(echo "$VPS_ORG" | sed -E 's/AS[0-9]+ //; s/,//g' | awk '{print $1}')
+        if [[ -n "$CLEAN_ORG" ]]; then
+            RAW=$(curl -s --connect-timeout 8 --max-time 15 "https://crt.sh/?q=%25.${CLEAN_ORG}.com&output=json" 2>/dev/null \
+                | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | sort -u | head -n 10)
+        fi
+    fi
+
+    for D in $RAW; do
+        [[ "$D" == *" "* ]] && continue
+        [[ ${#D} -gt 35 || "$D" != *.* ]] && continue
+        if probe_domain "$D"; then
+            echo "$D"
+            COUNT=$((COUNT + 1))
+            [[ $COUNT -ge 5 ]] && break
+        fi
+    done
+}
+
+# 方式二（兜底）：按运营商/机房推荐常用域名并实测
+preset_domains() {
+    local LIST D
+    case "$VPS_ORG" in
+        *DigitalOcean*)   LIST="images.digitalocean.com assets.digitalocean.com cloud.digitalocean.com" ;;
+        *Amazon*|*AWS*)   LIST="aws.amazon.com s3.amazonaws.com cloudfront.net" ;;
+        *Linode*|*Akamai*) LIST="login.linode.com assets.linode.com speedtest.tokyo2.linode.com" ;;
+        *Cloudflare*)     LIST="cdnjs.cloudflare.com dash.cloudflare.com workers.dev" ;;
+        *Tencent*|*Alibaba*) LIST="img3.doubanio.com static.zhihu.com images.unsplash.com" ;;
+        *)                LIST="images.unsplash.com cdn.pixabay.com swdist.apple.com dl.delivery.mp.microsoft.com www.microsoft.com" ;;
+    esac
+
+    for D in $LIST; do
+        probe_domain "$D" && echo "$D"
+    done
+}
+
+# 自动探测并挑选伪装域名，结果写入 PICKED_SNI
+auto_pick_sni() {
+    PICKED_SNI=""
+    echo -e "${GREEN}\n>>> 正在检测 VPS 网络归属...${PLAIN}"
+    detect_vps_info
+    echo -e "IP：${VPS_IP:-未知}   运营商：${VPS_ORG:-未知}   ASN：${VPS_ASN:-未知}"
+
+    local CAND_STR="" d
+    echo -e "${GREEN}>>> 方式一：从证书日志反查同网段/同运营商域名并实测 TLS 1.3...${PLAIN}"
+    CAND_STR=$(scan_domains_crt)
+
+    if [[ -z "$CAND_STR" ]]; then
+        echo -e "${YELLOW}未反查到可用域名，启用兜底：按运营商推荐常用域名并实测...${PLAIN}"
+        CAND_STR=$(preset_domains)
+    fi
+
+    if [[ -z "$CAND_STR" ]]; then
+        echo -e "${RED}两种方式均未找到支持 TLS 1.3 的域名，请检查网络或手动输入。${PLAIN}"
+        return 1
+    fi
+
+    local -a CAND=()
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && CAND+=("$d")
+    done <<< "$CAND_STR"
+
+    echo -e "${GREEN}\n可用的伪装域名：${PLAIN}"
+    local i
+    for i in "${!CAND[@]}"; do
+        echo -e "  $((i + 1)). ${CAND[$i]}"
+    done
+
+    local IDX
+    read -p "输入序号选择 [默认 1]: " IDX
+    IDX=${IDX:-1}
+    [[ ! "$IDX" =~ ^[0-9]+$ ]] && IDX=1
+    (( IDX < 1 || IDX > ${#CAND[@]} )) && IDX=1
+    PICKED_SNI="${CAND[$((IDX - 1))]}"
+    echo -e "${GREEN}已选择：$PICKED_SNI${PLAIN}"
+    return 0
+}
+
 # 获取公网 IP
 get_ip() {
     IP=$(curl -s4 -m 5 ifconfig.me || curl -s4 -m 5 api.ipify.org)
@@ -208,23 +313,31 @@ install_xhttp() {
         [[ "$ANS" == "y" || "$ANS" == "Y" ]] && break
     done
 
-    # 验证域名
+    # 输入伪装域名：留空则自动探测同网段/同运营商的合规域名
     while true; do
-        read -p "请输入用于 REALITY 的伪装域名 [默认 magnet.crowdcafe.com]: " SNI
-        SNI=$(normalize_host "${SNI:-magnet.crowdcafe.com}")
-        echo -e "${YELLOW}正在校验域名 $SNI 是否正常响应...${PLAIN}"
-        
-        /usr/local/bin/xray tls ping "$SNI" &>/dev/null
-        if [[ $? -eq 0 ]]; then
-            echo -e "${GREEN}域名 $SNI 校验通过！${PLAIN}"
-            break
-        else
-            echo -e "${RED}警告：域名 $SNI 握手超时，可能引发连通性问题。${PLAIN}"
-            read -p "是否强制使用此域名？(y/n) [默认 n]: " FORCE_SNI
+        read -p "请输入 REALITY 伪装域名（留空=自动探测推荐域名）: " SNI
+        if [[ -z "$SNI" ]]; then
+            if ! auto_pick_sni; then
+                echo -e "${YELLOW}自动探测未获得可用域名，请手动输入。${PLAIN}"
+                continue
+            fi
+            SNI="$PICKED_SNI"
+        fi
+        SNI=$(normalize_host "$SNI")
+
+        echo -e "${YELLOW}正在校验 $SNI 的 TLS 握手（REALITY 回落依赖它）...${PLAIN}"
+        PING_OUT=$(timeout 10 /usr/local/bin/xray tls ping "$SNI" 2>&1)
+        echo "$PING_OUT"
+        if ! echo "$PING_OUT" | grep -qE 'TLS[[:space:]]*1\.3'; then
+            echo -e "${RED}警告：$SNI 握手失败或不支持 TLS 1.3，REALITY 无法回落（客户端会报 EOF）。${PLAIN}"
+            read -p "强制使用请输入 y，换一个请输入 n [默认 n]: " FORCE_SNI
             if [[ "$FORCE_SNI" == "y" || "$FORCE_SNI" == "Y" ]]; then
                 break
             fi
+            continue
         fi
+        echo -e "${GREEN}域名 $SNI 校验通过（TLS 1.3）！${PLAIN}"
+        break
     done
 
     # 输入或生成自定义 Path
@@ -389,42 +502,34 @@ show_link() {
     qrencode -t ansiutf8 "$URL"
 }
 
-# 修改域名/SNI
-modify_sni() {
-    if [[ ! -f $CONFIG_FILE ]]; then
-        echo -e "${RED}未找到配置文件，请先安装！${PLAIN}"
-        return
-    fi
-    local CUR_SNI
-    CUR_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' $CONFIG_FILE 2>/dev/null)
-    echo -e "${BLUE}当前伪装域名：$CUR_SNI${PLAIN}"
-
-    read -p "请输入新的伪装域名 SNI: " NEW_SNI
-    NEW_SNI=$(normalize_host "$NEW_SNI")
+# 写入新的 SNI 并重启（含 TLS 校验与配置校验）
+apply_sni() {
+    local NEW_SNI PING_OUT TMP_JSON TEST_OUT
+    NEW_SNI=$(normalize_host "$1")
     if [[ -z "$NEW_SNI" ]]; then
-        echo -e "${YELLOW}未输入有效域名，已取消。${PLAIN}"
-        return
+        echo -e "${YELLOW}域名无效，已取消。${PLAIN}"
+        return 1
     fi
     echo -e "${BLUE}规范化后的域名：$NEW_SNI${PLAIN}"
 
     # REALITY 依赖目标站点的 TLS 回落，握手不通或不支持 X25519 都会导致客户端报 EOF
     echo -e "${YELLOW}正在校验 $NEW_SNI 的 TLS 握手（REALITY 回落依赖它）...${PLAIN}"
-    PING_OUT=$(/usr/local/bin/xray tls ping "$NEW_SNI" 2>&1)
+    PING_OUT=$(timeout 10 /usr/local/bin/xray tls ping "$NEW_SNI" 2>&1)
     echo "$PING_OUT"
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}警告：$NEW_SNI 握手失败，REALITY 无法回落，客户端通常会报 EOF。${PLAIN}"
+    if ! echo "$PING_OUT" | grep -qE 'TLS[[:space:]]*1\.3'; then
+        echo -e "${RED}警告：$NEW_SNI 握手失败或不支持 TLS 1.3，REALITY 无法回落（客户端会报 EOF）。${PLAIN}"
         read -p "仍要强制使用？(y/n) [默认 n]: " FORCE_SNI
         if [[ "$FORCE_SNI" != "y" && "$FORCE_SNI" != "Y" ]]; then
             echo -e "${YELLOW}已取消，配置未改动。${PLAIN}"
-            return
+            return 1
         fi
     else
-        echo -e "${YELLOW}请确认上面输出中 TLS 版本为 1.3、密钥交换为 X25519，否则 REALITY 会失败。${PLAIN}"
+        echo -e "${YELLOW}请确认上面输出中密钥交换为 X25519，否则 REALITY 会失败。${PLAIN}"
         read -p "确认继续？(y/n) [默认 y]: " OK_SNI
         OK_SNI=${OK_SNI:-y}
         if [[ "$OK_SNI" != "y" && "$OK_SNI" != "Y" ]]; then
             echo -e "${YELLOW}已取消，配置未改动。${PLAIN}"
-            return
+            return 1
         fi
     fi
 
@@ -455,6 +560,43 @@ modify_sni() {
     echo -e "${GREEN}伪装域名已更新为 $NEW_SNI，Xray 已重启。${PLAIN}"
     echo -e "${RED}重要：SNI 变更后客户端必须用下面的新链接重新导入，否则握手失败（EOF）。${PLAIN}"
     show_link
+}
+
+# 修改域名/SNI
+modify_sni() {
+    if [[ ! -f $CONFIG_FILE ]]; then
+        echo -e "${RED}未找到配置文件，请先安装！${PLAIN}"
+        return
+    fi
+    local CUR_SNI NEW_SNI
+    CUR_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' $CONFIG_FILE 2>/dev/null)
+    echo -e "${BLUE}当前伪装域名：$CUR_SNI${PLAIN}"
+
+    read -p "请输入新的伪装域名（留空=自动探测）: " NEW_SNI
+    if [[ -z "$NEW_SNI" ]]; then
+        auto_pick_sni || return
+        NEW_SNI="$PICKED_SNI"
+    fi
+    apply_sni "$NEW_SNI"
+}
+
+# 自动探测伪装域名（只探测，可选应用到当前节点）
+scan_sni_menu() {
+    if ! auto_pick_sni; then
+        return
+    fi
+    if [[ ! -f $CONFIG_FILE ]]; then
+        echo -e "${YELLOW}尚未部署，可在安装时（菜单 1）直接回车使用自动探测。${PLAIN}"
+        return
+    fi
+    local APPLY
+    read -p "是否将本机伪装域名改为 $PICKED_SNI？(y/n) [默认 y]: " APPLY
+    APPLY=${APPLY:-y}
+    if [[ "$APPLY" == "y" || "$APPLY" == "Y" ]]; then
+        apply_sni "$PICKED_SNI"
+    else
+        echo -e "${YELLOW}未改动配置，仅展示探测结果。${PLAIN}"
+    fi
 }
 
 # 修改 UUID
@@ -606,9 +748,10 @@ main_menu() {
         echo -e " 6. 重启 Xray 服务"
         echo -e " 7. 重新生成 REALITY 密钥对（修复空私钥）"
         echo -e " 8. 更新脚本到最新版（从 Git 拉取）"
+        echo -e " 9. 自动探测可用的伪装域名（SNI）"
         echo -e " 0. 退出脚本"
         echo -e "${GREEN}==============================================${PLAIN}"
-        read -p "请输入数字选择功能 [0-8]: " choice
+        read -p "请输入数字选择功能 [0-9]: " choice
 
         case "$choice" in
             1) install_xhttp ;;
@@ -619,6 +762,7 @@ main_menu() {
             6) systemctl restart xray && echo -e "${GREEN}Xray 服务已重启！${PLAIN}" ;;
             7) regen_keys ;;
             8) self_update ;;
+            9) scan_sni_menu ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
