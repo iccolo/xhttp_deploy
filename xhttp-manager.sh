@@ -350,8 +350,7 @@ ENVEOF
         echo -e "${RED}Xray 启动失败！${PLAIN}"
         echo -e "${YELLOW}>>> 最近 20 条日志：${PLAIN}"
         journalctl -u xray -n 20 --no-pager
-        echo -e "${YELLOW}>>> 端口占用情况：${PLAIN}"
-        ss -tlnp "sport = :$PORT" 2>/dev/null
+        diag_service
     fi
 }
 
@@ -446,6 +445,7 @@ modify_sni() {
     if ! systemctl is-active --quiet xray; then
         echo -e "${RED}Xray 重启失败，日志如下：${PLAIN}"
         journalctl -u xray -n 20 --no-pager
+        diag_service
         return 1
     fi
 
@@ -472,12 +472,47 @@ modify_uuid() {
     show_link
 }
 
+# 启动失败时的定向诊断（特权端口 / 运行用户 / 端口占用 / 残留进程）
+diag_service() {
+    echo -e "${YELLOW}>>> 启动失败定向诊断：${PLAIN}"
+
+    local SVC PORT
+    SVC=$(systemctl show -p FragmentPath xray 2>/dev/null | cut -d= -f2)
+    [[ -z "$SVC" || ! -f "$SVC" ]] && SVC="/etc/systemd/system/xray.service"
+
+    if [[ -f "$SVC" ]]; then
+        echo -e "${BLUE}--- service 文件：$SVC${PLAIN}"
+        grep -E '^(User|Group|CapabilityBoundingSet|AmbientCapabilities|NoNewPrivileges|ExecStart)' "$SVC" 2>/dev/null
+    fi
+
+    echo -e "${BLUE}--- systemd 版本：$(systemctl --version 2>/dev/null | head -1)${PLAIN}"
+
+    PORT=$(jq -r '.inbounds[0].port // empty' $CONFIG_FILE 2>/dev/null)
+    if [[ -n "$PORT" && "$PORT" -lt 1024 ]]; then
+        echo -e "${RED}端口 $PORT 是特权端口（<1024）。${PLAIN}"
+        if grep -qE '^User=(nobody|xray|www-data)' "$SVC" 2>/dev/null; then
+            echo -e "${RED}service 以非 root 用户运行，若缺少 AmbientCapabilities=CAP_NET_BIND_SERVICE"
+            echo -e "（或 systemd < 229 不支持该特性），Xray 会因无法绑定端口而启动失败（exit 23）。${PLAIN}"
+            echo -e "${YELLOW}处理：把 User 改成 root，或改用 1024 以上端口。${PLAIN}"
+        fi
+    fi
+
+    echo -e "${BLUE}--- 端口占用：${PLAIN}"
+    ss -tlnp "sport = :${PORT}" 2>/dev/null || echo "(无)"
+    echo -e "${BLUE}--- 残留 xray 进程：${PLAIN}"
+    ps -o pid,user,cmd -C xray 2>/dev/null | tail -n +2 || echo "(无)"
+}
+
 # 检查服务状态
 check_status() {
     echo -e "\n${BLUE}>>> Xray 服务运行状态：${PLAIN}"
     systemctl status xray --no-pager
     echo -e "\n${BLUE}>>> 查看最近 10 条日志：${PLAIN}"
     journalctl -u xray -n 10 --no-pager
+
+    if ! systemctl is-active --quiet xray; then
+        diag_service
+    fi
 }
 
 # 重新生成 REALITY 密钥对（修复 privateKey 为空 / 密钥泄露）
@@ -522,6 +557,7 @@ ENVEOF
     else
         echo -e "${RED}Xray 启动失败，日志如下：${PLAIN}"
         journalctl -u xray -n 20 --no-pager
+        diag_service
     fi
 }
 
