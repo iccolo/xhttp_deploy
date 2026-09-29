@@ -332,6 +332,9 @@ ENVEOF
     fi
     echo "$TEST_OUT" | tail -2
 
+    # 重装后 service 可能被官方脚本覆盖为 nobody，特权端口下需先修正运行用户
+    ensure_service_permission
+
     # 重启服务并检查运行状态
     systemctl restart xray
     systemctl enable xray &>/dev/null
@@ -470,6 +473,26 @@ modify_uuid() {
     systemctl restart xray
     echo -e "${GREEN}UUID 已更新为: $NEW_UUID，Xray 已重启。${PLAIN}"
     show_link
+}
+
+# 重装 Xray 后官方脚本会把 service 覆盖为 User=nobody，
+# 特权端口(<1024)下若无 CAP_NET_BIND_SERVICE 将无法启动，这里自动修正为 root
+ensure_service_permission() {
+    local SVC PORT
+    SVC=$(systemctl show -p FragmentPath xray 2>/dev/null | cut -d= -f2)
+    [[ -z "$SVC" || ! -f "$SVC" ]] && SVC="/etc/systemd/system/xray.service"
+    [[ -f "$SVC" ]] || return 0
+
+    PORT=$(jq -r '.inbounds[0].port // empty' $CONFIG_FILE 2>/dev/null)
+    [[ -n "$PORT" && "$PORT" -lt 1024 ]] || return 0
+
+    if grep -qE '^User=(nobody|xray|www-data)' "$SVC" 2>/dev/null && \
+       ! grep -qE '^AmbientCapabilities=.*CAP_NET_BIND_SERVICE' "$SVC" 2>/dev/null; then
+        echo -e "${YELLOW}检测到 service 以非 root 用户运行且无 CAP_NET_BIND_SERVICE，"
+        echo -e "端口 $PORT 为特权端口无法绑定，已自动改为 root 运行。${PLAIN}"
+        sed -i 's/^User=.*/User=root/' "$SVC"
+        systemctl daemon-reload
+    fi
 }
 
 # 启动失败时的定向诊断（特权端口 / 运行用户 / 端口占用 / 残留进程）
