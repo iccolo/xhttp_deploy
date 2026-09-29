@@ -77,6 +77,37 @@ xray -test -c /usr/local/etc/xray/config.json
 journalctl -u xray -n 20 --no-pager
 ```
 
+**服务起不来，日志显示 `status=23`**
+
+先判断是配置问题还是运行时问题：
+
+```bash
+xray -test -c /usr/local/etc/xray/config.json
+```
+
+- 报错 → 配置本身有问题，按报错修
+- 输出 `Configuration OK` → 配置没问题，是**运行时**失败，最常见的是运行用户无权绑定特权端口
+
+端口 < 1024（如 443）时，若 `/etc/systemd/system/xray.service` 里是 `User=nobody` 且缺少 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（或 systemd 版本 < 229 不支持该特性），Xray 会因绑定端口失败而退出。修复：
+
+```bash
+sed -i 's/^User=.*/User=root/' /etc/systemd/system/xray.service
+systemctl daemon-reload && systemctl restart xray
+systemctl is-active xray
+```
+
+更安全的方式是保留 `nobody` 并加上 capabilities（需 systemd ≥ 229）：
+
+```ini
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+```
+
+脚本菜单 5 在服务未运行时会自动打印这类诊断（service 的 User/Capabilities、systemd 版本、端口是否特权、端口占用、残留进程）。
+
 **端口被占用**
 
 ```bash
