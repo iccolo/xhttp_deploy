@@ -303,6 +303,24 @@ auto_pick_sni() {
     return 0
 }
 
+# 用 jq 改写配置并写回。
+# 注意：mktemp 生成的文件是 600，直接用 mv 覆盖会把 config.json 权限改成 600，
+# 导致 Xray 以 nobody 等非 root 用户运行时读不到配置（启动失败 exit 23）。
+# 这里用 cat 覆盖保留原文件权限，并显式设为 644。
+jq_write() {
+    local TMP_JSON
+    TMP_JSON=$(mktemp)
+    if ! jq "$@" $CONFIG_FILE > $TMP_JSON; then
+        echo -e "${RED}配置改写失败（jq 出错），已放弃。${PLAIN}"
+        rm -f $TMP_JSON
+        return 1
+    fi
+    cat $TMP_JSON > $CONFIG_FILE
+    rm -f $TMP_JSON
+    chmod 644 $CONFIG_FILE
+    return 0
+}
+
 # 获取公网 IP
 get_ip() {
     IP=$(curl -s4 -m 5 ifconfig.me || curl -s4 -m 5 api.ipify.org)
@@ -441,6 +459,8 @@ install_xhttp() {
 }
 JSONEOF
 
+    chmod 644 $CONFIG_FILE
+
     # 保存公钥与地区缩写
     get_region
     save_info
@@ -564,13 +584,9 @@ apply_sni() {
         fi
     fi
 
-    TMP_JSON=$(mktemp)
-    if ! jq --arg sni "$NEW_SNI" '.inbounds[0].streamSettings.realitySettings.serverNames[0] = $sni | .inbounds[0].streamSettings.realitySettings.dest = ($sni + ":443")' $CONFIG_FILE > $TMP_JSON; then
-        echo -e "${RED}配置改写失败（jq 出错），已放弃。${PLAIN}"
-        rm -f $TMP_JSON
+    if ! jq_write --arg sni "$NEW_SNI" '.inbounds[0].streamSettings.realitySettings.serverNames[0] = $sni | .inbounds[0].streamSettings.realitySettings.dest = ($sni + ":443")'; then
         return 1
     fi
-    mv $TMP_JSON $CONFIG_FILE
 
     TEST_OUT=$(/usr/local/bin/xray -test -c "$CONFIG_FILE" 2>&1)
     if [[ $? -ne 0 ]]; then
@@ -639,9 +655,7 @@ modify_uuid() {
     read -p "请输入新的 UUID (留空自动生成): " NEW_UUID
     [[ -z "$NEW_UUID" ]] && NEW_UUID=$(/usr/local/bin/xray uuid)
 
-    TMP_JSON=$(mktemp)
-    jq --arg uuid "$NEW_UUID" '.inbounds[0].settings.clients[0].id = $uuid' $CONFIG_FILE > $TMP_JSON
-    mv $TMP_JSON $CONFIG_FILE
+    jq_write --arg uuid "$NEW_UUID" '.inbounds[0].settings.clients[0].id = $uuid' || return 1
 
     systemctl restart xray
     echo -e "${GREEN}UUID 已更新为: $NEW_UUID，Xray 已重启。${PLAIN}"
@@ -693,6 +707,9 @@ diag_service() {
         fi
     fi
 
+    echo -e "${BLUE}--- 配置文件权限（非 root 运行需可读）：${PLAIN}"
+    ls -l "$CONFIG_FILE" 2>/dev/null
+
     echo -e "${BLUE}--- 端口占用：${PLAIN}"
     ss -tlnp "sport = :${PORT}" 2>/dev/null || echo "(无)"
     echo -e "${BLUE}--- 残留 xray 进程：${PLAIN}"
@@ -728,9 +745,7 @@ regen_keys() {
         return 1
     fi
 
-    TMP_JSON=$(mktemp)
-    jq --arg pri "$PRIKEY" '.inbounds[0].streamSettings.realitySettings.privateKey = $pri' $CONFIG_FILE > $TMP_JSON
-    mv $TMP_JSON $CONFIG_FILE
+    jq_write --arg pri "$PRIKEY" '.inbounds[0].streamSettings.realitySettings.privateKey = $pri' || return 1
 
     # 保留原有地区缩写（读缓存），只更新公钥
     get_region

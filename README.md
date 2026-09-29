@@ -120,7 +120,13 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ```
 
-脚本菜单 5 在服务未运行时会自动打印这类诊断（service 的 User/Capabilities、systemd 版本、端口是否特权、端口占用、残留进程）。
+**配置文件权限被改成 600** 也会导致同样的失败：`mktemp` 生成的临时文件是 600，用 `mv` 覆盖会把 `config.json` 权限带成 600，非 root 用户（如 `nobody`）就读不到配置。脚本已统一改为 `cat` 覆盖并显式设为 644；旧配置可手动修正：
+
+```bash
+chmod 644 /usr/local/etc/xray/config.json
+```
+
+脚本菜单 5 在服务未运行时会自动打印这类诊断（service 的 User/Capabilities、systemd 版本、端口是否特权、配置文件权限、端口占用、残留进程）。
 
 **端口被占用**
 
